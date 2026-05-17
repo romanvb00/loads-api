@@ -14,7 +14,7 @@ import uvicorn
 # ── Config ───────────────────────────────────────────────────────────────────
 API_KEY      = os.getenv("API_KEY", "change-me-in-production")
 CSV_PATH     = os.getenv("CSV_PATH", "loads_sample.csv")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Optional — set after adding Postgres in Railway
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
@@ -23,72 +23,10 @@ df = pd.read_csv(CSV_PATH, sep=";")
 df["load_id"] = df["load_id"].astype(str).str.zfill(5)
 df = df.where(pd.notnull(df), None)
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-def db_available():
-    return DATABASE_URL is not None
-
-@contextmanager
-def get_conn():
-    if not db_available():
-        raise HTTPException(status_code=503, detail="Database not configured. Add PostgreSQL in Railway and set DATABASE_URL.")
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-def init_db():
-    """Create tables if DB is available. Safe to skip if not."""
-    if not db_available():
-        print("⚠️  DATABASE_URL not set — webhook/dashboard endpoints disabled until Postgres is added.")
-        return
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS webhook_calls (
-                        id          SERIAL PRIMARY KEY,
-                        received_at TIMESTAMPTZ DEFAULT NOW(),
-                        mc_number   TEXT,
-                        response    TEXT,
-                        transcript  TEXT,
-                        load_id     TEXT,
-                        origin      TEXT,
-                        destination TEXT,
-                        pickup      TEXT,
-                        delivery    TEXT,
-                        equipment   TEXT,
-                        rate        TEXT,
-                        notes       TEXT,
-                        weight      TEXT,
-                        type        TEXT,
-                        num_pieces  TEXT,
-                        miles       TEXT,
-                        dim         TEXT,
-                        timedate    TEXT,
-                        phonenumber TEXT
-                    );
-                """)
-                # Migrate existing tables — safe to run repeatedly
-                for col in ["timedate", "phonenumber"]:
-                    cur.execute(f"""
-                        ALTER TABLE webhook_calls
-                        ADD COLUMN IF NOT EXISTS {col} TEXT;
-                    """)
-        print("✅ Database initialised.")
-    except Exception as e:
-        print(f"⚠️  DB init failed: {e}")
-
-init_db()
-
-# ── Auth ──────────────────────────────────────────────────────────────────────
-async def verify_api_key(key: str = Security(api_key_header)):
-    if key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
-    return key
-
-# ── Webhook schema ────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# WEBHOOK SCHEMA
+# To add a new field: just add a line here. The DB table updates automatically.
+# ──────────────────────────────────────────────────────────────────────────────
 class WebhookPayload(BaseModel):
     mc_number:   Optional[str] = None
     response:    Optional[str] = None
@@ -108,9 +46,74 @@ class WebhookPayload(BaseModel):
     dim:         Optional[str] = None
     timedate:    Optional[str] = None
     phonenumber: Optional[str] = None
+    price:       Optional[str] = None
+    # ← añade nuevos campos aquí, el resto es automático
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+def db_available():
+    return DATABASE_URL is not None
+
+@contextmanager
+def get_conn():
+    if not db_available():
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+def init_db():
+    """
+    Auto-sync the DB table with WebhookPayload fields.
+    - Creates the table if it doesn't exist
+    - Adds any missing columns automatically (no manual ALTER TABLE needed)
+    """
+    if not db_available():
+        print("⚠️  DATABASE_URL not set — webhook/dashboard endpoints disabled.")
+        return
+
+    # Derive column list directly from the Pydantic model
+    payload_fields = list(WebhookPayload.model_fields.keys())
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Create table with fixed columns + all payload fields
+                fields_ddl = "\n".join(f"                        {col:<15} TEXT," for col in payload_fields)
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS webhook_calls (
+                        id          SERIAL PRIMARY KEY,
+                        received_at TIMESTAMPTZ DEFAULT NOW(),
+                        {fields_ddl}
+                        PRIMARY KEY (id)
+                    );
+                """.replace("PRIMARY KEY (id),", ""))  # remove duplicate PK
+
+                # Add any missing columns (safe to run on every startup)
+                cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'webhook_calls';")
+                existing_cols = {row[0] for row in cur.fetchall()}
+
+                for col in payload_fields:
+                    if col not in existing_cols:
+                        cur.execute(f"ALTER TABLE webhook_calls ADD COLUMN IF NOT EXISTS {col} TEXT;")
+                        print(f"  ➕ Added column: {col}")
+
+        print(f"✅ DB ready. Columns: {', '.join(payload_fields)}")
+    except Exception as e:
+        print(f"⚠️  DB init failed: {e}")
+
+init_db()
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+async def verify_api_key(key: str = Security(api_key_header)):
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+    return key
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Loads API", version="2.0.0")
+app = FastAPI(title="Loads API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,7 +122,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Existing endpoints ────────────────────────────────────────────────────────
+# ── CSV endpoints ─────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
@@ -148,20 +151,15 @@ def list_loads(skip: int = 0, limit: int = 50):
 # ── Webhook receiver ──────────────────────────────────────────────────────────
 @app.post("/webhook", dependencies=[Depends(verify_api_key)])
 def receive_webhook(payload: WebhookPayload):
+    data = payload.model_dump()
+    cols = ", ".join(data.keys())
+    placeholders = ", ".join(f"%({k})s" for k in data.keys())
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO webhook_calls
-                    (mc_number,response,transcript,load_id,origin,destination,
-                     pickup,delivery,equipment,rate,notes,weight,type,num_pieces,miles,dim,
-                     timedate,phonenumber)
-                VALUES
-                    (%(mc_number)s,%(response)s,%(transcript)s,%(load_id)s,%(origin)s,
-                     %(destination)s,%(pickup)s,%(delivery)s,%(equipment)s,%(rate)s,
-                     %(notes)s,%(weight)s,%(type)s,%(num_pieces)s,%(miles)s,%(dim)s,
-                     %(timedate)s,%(phonenumber)s)
-                RETURNING id, received_at;
-            """, payload.model_dump())
+            cur.execute(
+                f"INSERT INTO webhook_calls ({cols}) VALUES ({placeholders}) RETURNING id, received_at;",
+                data
+            )
             row = cur.fetchone()
     return {"ok": True, "id": row[0], "received_at": row[1].isoformat()}
 
