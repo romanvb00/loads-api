@@ -14,7 +14,7 @@ import uvicorn
 # ── Config ───────────────────────────────────────────────────────────────────
 API_KEY      = os.getenv("API_KEY", "change-me-in-production")
 CSV_PATH     = os.getenv("CSV_PATH", "loads_sample.csv")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Optional — set after adding Postgres in Railway
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
@@ -24,8 +24,13 @@ df["load_id"] = df["load_id"].astype(str).str.zfill(5)
 df = df.where(pd.notnull(df), None)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
+def db_available():
+    return DATABASE_URL is not None
+
 @contextmanager
 def get_conn():
+    if not db_available():
+        raise HTTPException(status_code=503, detail="Database not configured. Add PostgreSQL in Railway and set DATABASE_URL.")
     conn = psycopg2.connect(DATABASE_URL)
     try:
         yield conn
@@ -34,30 +39,38 @@ def get_conn():
         conn.close()
 
 def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS webhook_calls (
-                    id          SERIAL PRIMARY KEY,
-                    received_at TIMESTAMPTZ DEFAULT NOW(),
-                    mc_number   TEXT,
-                    response    TEXT,
-                    transcript  TEXT,
-                    load_id     TEXT,
-                    origin      TEXT,
-                    destination TEXT,
-                    pickup      TEXT,
-                    delivery    TEXT,
-                    equipment   TEXT,
-                    rate        TEXT,
-                    notes       TEXT,
-                    weight      TEXT,
-                    type        TEXT,
-                    num_pieces  TEXT,
-                    miles       TEXT,
-                    dim         TEXT
-                );
-            """)
+    """Create tables if DB is available. Safe to skip if not."""
+    if not db_available():
+        print("⚠️  DATABASE_URL not set — webhook/dashboard endpoints disabled until Postgres is added.")
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS webhook_calls (
+                        id          SERIAL PRIMARY KEY,
+                        received_at TIMESTAMPTZ DEFAULT NOW(),
+                        mc_number   TEXT,
+                        response    TEXT,
+                        transcript  TEXT,
+                        load_id     TEXT,
+                        origin      TEXT,
+                        destination TEXT,
+                        pickup      TEXT,
+                        delivery    TEXT,
+                        equipment   TEXT,
+                        rate        TEXT,
+                        notes       TEXT,
+                        weight      TEXT,
+                        type        TEXT,
+                        num_pieces  TEXT,
+                        miles       TEXT,
+                        dim         TEXT
+                    );
+                """)
+        print("✅ Database initialised.")
+    except Exception as e:
+        print(f"⚠️  DB init failed: {e}")
 
 init_db()
 
@@ -99,7 +112,11 @@ app.add_middleware(
 # ── Existing endpoints ────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "total_loads": len(df)}
+    return {
+        "status": "ok",
+        "total_loads": len(df),
+        "database": "connected" if db_available() else "not configured"
+    }
 
 @app.get("/load/{load_id}", dependencies=[Depends(verify_api_key)])
 def get_load(load_id: str):
@@ -136,7 +153,7 @@ def receive_webhook(payload: WebhookPayload):
             row = cur.fetchone()
     return {"ok": True, "id": row[0], "received_at": row[1].isoformat()}
 
-# ── Dashboard endpoints (consumed by Lovable) ─────────────────────────────────
+# ── Dashboard endpoints ───────────────────────────────────────────────────────
 @app.get("/dashboard/calls", dependencies=[Depends(verify_api_key)])
 def dashboard_calls():
     with get_conn() as conn:
