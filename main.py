@@ -65,9 +65,17 @@ def init_db():
                         type        TEXT,
                         num_pieces  TEXT,
                         miles       TEXT,
-                        dim         TEXT
+                        dim         TEXT,
+                        timedate    TEXT,
+                        phonenumber TEXT
                     );
                 """)
+                # Migrate existing tables — safe to run repeatedly
+                for col in ["timedate", "phonenumber"]:
+                    cur.execute(f"""
+                        ALTER TABLE webhook_calls
+                        ADD COLUMN IF NOT EXISTS {col} TEXT;
+                    """)
         print("✅ Database initialised.")
     except Exception as e:
         print(f"⚠️  DB init failed: {e}")
@@ -98,6 +106,8 @@ class WebhookPayload(BaseModel):
     num_pieces:  Optional[str] = None
     miles:       Optional[str] = None
     dim:         Optional[str] = None
+    timedate:    Optional[str] = None
+    phonenumber: Optional[str] = None
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Loads API", version="2.0.0")
@@ -143,11 +153,13 @@ def receive_webhook(payload: WebhookPayload):
             cur.execute("""
                 INSERT INTO webhook_calls
                     (mc_number,response,transcript,load_id,origin,destination,
-                     pickup,delivery,equipment,rate,notes,weight,type,num_pieces,miles,dim)
+                     pickup,delivery,equipment,rate,notes,weight,type,num_pieces,miles,dim,
+                     timedate,phonenumber)
                 VALUES
                     (%(mc_number)s,%(response)s,%(transcript)s,%(load_id)s,%(origin)s,
                      %(destination)s,%(pickup)s,%(delivery)s,%(equipment)s,%(rate)s,
-                     %(notes)s,%(weight)s,%(type)s,%(num_pieces)s,%(miles)s,%(dim)s)
+                     %(notes)s,%(weight)s,%(type)s,%(num_pieces)s,%(miles)s,%(dim)s,
+                     %(timedate)s,%(phonenumber)s)
                 RETURNING id, received_at;
             """, payload.model_dump())
             row = cur.fetchone()
